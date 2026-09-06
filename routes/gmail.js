@@ -8,7 +8,7 @@ const router = express.Router();
 const oauth2Client = new google.auth.OAuth2(
   process.env.GOOGLE_CLIENT_ID,
   process.env.GOOGLE_CLIENT_SECRET,
-  process.env.GOOGLE_REDIRECT_URI // e.g. https://your-app.up.railway.app/api/gmail/callback
+  process.env.GOOGLE_REDIRECT_URI
 );
 
 const SCOPES = ['https://www.googleapis.com/auth/gmail.readonly'];
@@ -44,17 +44,21 @@ async function loadRefreshToken() {
   return result.rows[0]?.refresh_token || null;
 }
 
-// Step 1: visit this URL in your browser to grant access.
 router.get('/auth', (req, res) => {
+  if (!process.env.GOOGLE_CLIENT_ID || !process.env.GOOGLE_REDIRECT_URI) {
+    return res.status(500).send(
+      'Missing GOOGLE_CLIENT_ID or GOOGLE_REDIRECT_URI environment variable on the server.'
+    );
+  }
   const url = oauth2Client.generateAuthUrl({
-    access_type: 'offline', // required to get a refresh_token
-    prompt: 'consent',      // forces Google to re-issue the refresh_token
+    access_type: 'offline',
+    prompt: 'consent',
     scope: SCOPES,
+    redirect_uri: process.env.GOOGLE_REDIRECT_URI,
   });
   res.redirect(url);
 });
 
-// Step 2: Google redirects here after you approve access.
 router.get('/callback', async (req, res) => {
   try {
     const { tokens } = await oauth2Client.getToken(req.query.code);
@@ -76,8 +80,6 @@ router.get('/callback', async (req, res) => {
   }
 });
 
-// Pulls receipt emails from the last `days` days and inserts new ones.
-// Called manually (POST /api/gmail/sync) or by the scheduled job.
 async function syncGmail(days = 30) {
   const refreshToken = await loadRefreshToken();
   if (!refreshToken) {
