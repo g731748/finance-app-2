@@ -1,11 +1,11 @@
 require('dotenv').config();
-// force rebuild
 const express = require('express');
 const cors = require('cors');
 const cron = require('node-cron');
 
 const transactionsRouter = require('./routes/transactions');
 const { router: gmailRouter, syncGmail } = require('./routes/gmail');
+const { router: bankRouter } = require('./routes/bank');
 
 const app = express();
 app.use(cors());
@@ -17,10 +17,8 @@ app.get('/', (req, res) => {
 
 app.use('/api/transactions', transactionsRouter);
 app.use('/api/gmail', gmailRouter);
+app.use('/api/bank', bankRouter);
 
-// Runs once a day at 06:00 server time -- pulls new receipts from the last
-// 2 days (overlap on purpose so nothing gets missed between runs; the
-// database's unique constraint on (source, external_id) prevents duplicates).
 cron.schedule('0 6 * * *', async () => {
   try {
     const result = await syncGmail(2);
