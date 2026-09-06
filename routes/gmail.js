@@ -151,4 +151,18 @@ router.post('/sync', async (req, res) => {
   }
 });
 
+router.get('/sync-now', async (req, res) => {
+  try {
+    const days = parseInt(req.query.days, 10) || 30;
+    const result = await syncGmail(days);
+    res.send(
+      `Scanned ${result.scanned} emails, added ${result.inserted} new transactions. ` +
+      `You can close this tab and check /api/transactions.`
+    );
+  } catch (err) {
+    console.error(err);
+    res.status(500).send(`Sync failed: ${err.message}`);
+  }
+});
+
 module.exports = { router, syncGmail };
