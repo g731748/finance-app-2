@@ -128,7 +128,7 @@ async function syncGmail(days = 30) {
       const result = await pool.query(
         `INSERT INTO transactions (date, type, amount, category, note, vat_eligible, source, external_id)
          VALUES ($1, 'expense', $2, $3, $4, TRUE, 'gmail', $5)
-         ON CONFLICT (source, external_id) DO NOTHING RETURNING id`,
+         ON CONFLICT (source, external_id) WHERE external_id IS NOT NULL DO NOTHING RETURNING id`,
         [dateHeader.toISOString().slice(0, 10), amount || 0, sender, subject, ref.id]
       );
       if (result.rowCount) inserted += 1;
