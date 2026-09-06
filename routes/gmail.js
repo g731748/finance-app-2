@@ -17,15 +17,52 @@ const SEARCH_QUERY =
   '(subject:חשבונית OR subject:קבלה OR subject:invoice OR subject:receipt ' +
   'OR subject:"אישור תשלום" OR subject:"אישור חיוב")';
 
-const AMOUNT_PATTERN = /(?:₪|ILS|NIS|\$|USD)\s?([\d,]+\.?\d{0,2})|([\d,]+\.?\d{0,2})\s?(?:₪|ILS|NIS)/;
+const AMOUNT_PATTERN = /(?:₪|ILS|NIS|\$|USD)\s?([\d,]+\.?\d{0,2})|([\d,]+\.?\d{0,2})\s?(?:₪|ILS|NIS)/g;
+
+const TOTAL_KEYWORDS = [
+  'סה"כ לתשלום', 'סך הכל לתשלום', 'סה"כ לתשלום כולל מע"מ',
+  'סה"כ', 'סך הכל', 'לתשלום', 'total amount', 'amount due', 'total due', 'grand total', 'total',
+];
+
+function parseNumber(raw) {
+  const value = parseFloat(String(raw).replace(/,/g, ''));
+  return Number.isFinite(value) ? value : null;
+}
+
+function extractAmountNearKeywords(text) {
+  if (!text) return null;
+  const lowerText = text.toLowerCase();
+  let best = null;
+  for (const keyword of TOTAL_KEYWORDS) {
+    const lowerKeyword = keyword.toLowerCase();
+    let searchFrom = 0;
+    let idx;
+    while ((idx = lowerText.indexOf(lowerKeyword, searchFrom)) !== -1) {
+      const afterWindow = text.slice(idx + keyword.length, idx + keyword.length + 25);
+      const beforeWindow = text.slice(Math.max(0, idx - 25), idx);
+      const numMatch =
+        afterWindow.match(/[\d,]+\.\d{2}|[\d,]{2,}/) ||
+        beforeWindow.match(/[\d,]+\.\d{2}|[\d,]{2,}/);
+      if (numMatch) {
+        const value = parseNumber(numMatch[0]);
+        if (value !== null) best = value;
+      }
+      searchFrom = idx + keyword.length;
+    }
+  }
+  return best;
+}
+
+function extractAmountByCurrency(text) {
+  if (!text) return null;
+  const matches = [...text.matchAll(AMOUNT_PATTERN)];
+  if (!matches.length) return null;
+  const last = matches[matches.length - 1];
+  return parseNumber(last[1] || last[2]);
+}
 
 function extractAmount(text) {
-  if (!text) return null;
-  const match = AMOUNT_PATTERN.exec(text);
-  if (!match) return null;
-  const raw = (match[1] || match[2] || '').replace(/,/g, '');
-  const value = parseFloat(raw);
-  return Number.isFinite(value) ? value : null;
+  return extractAmountNearKeywords(text) ?? extractAmountByCurrency(text);
 }
 
 function decodeBody(payload) {
@@ -122,13 +159,16 @@ async function syncGmail(days = 30) {
       }
     }
 
-    const amount = extractAmount(body) || extractAmount(attachmentText) || extractAmount(subject);
+    const amount = extractAmount(attachmentText) || extractAmount(body) || extractAmount(subject);
 
     try {
       const result = await pool.query(
         `INSERT INTO transactions (date, type, amount, category, note, vat_eligible, source, external_id)
          VALUES ($1, 'expense', $2, $3, $4, TRUE, 'gmail', $5)
-         ON CONFLICT (source, external_id) WHERE external_id IS NOT NULL DO NOTHING RETURNING id`,
+         ON CONFLICT (source, external_id) WHERE external_id IS NOT NULL
+         DO UPDATE SET amount = EXCLUDED.amount
+         WHERE transactions.amount = 0 AND EXCLUDED.amount != 0
+         RETURNING id, (xmax = 0) AS inserted`,
         [dateHeader.toISOString().slice(0, 10), amount || 0, sender, subject, ref.id]
       );
       if (result.rowCount) inserted += 1;
