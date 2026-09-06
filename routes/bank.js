@@ -70,6 +70,31 @@ function parseAmount(raw) {
   return Number.isFinite(value) ? value : 0;
 }
 
+function stripHtmlTags(html) {
+  return html
+    .replace(/<[^>]*>/g, ' ')
+    .replace(/&nbsp;/g, ' ')
+    .replace(/&amp;/g, '&')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function looksLikeHtml(buffer) {
+  const head = buffer.slice(0, 2000).toString('utf8').toLowerCase();
+  return head.includes('<html') || head.includes('<table');
+}
+
+function parseHtmlTableRows(html) {
+  const rows = [];
+  const trMatches = html.matchAll(/<tr[^>]*>([\s\S]*?)<\/tr>/gi);
+  for (const trMatch of trMatches) {
+    const tdMatches = [...trMatch[1].matchAll(/<td[^>]*>([\s\S]*?)<\/td>/gi)];
+    if (!tdMatches.length) continue;
+    rows.push(tdMatches.map((td) => stripHtmlTags(td[1])));
+  }
+  return rows;
+}
+
 router.get('/import-form', (req, res) => {
   res.send(`<!DOCTYPE html>
 <html lang="he" dir="rtl"><head><meta charset="UTF-8"><title>ייבוא קובץ בנק</title>
@@ -90,14 +115,36 @@ router.post('/import', upload.single('statement'), async (req, res) => {
   if (!req.file) return res.status(400).send('No file uploaded -- use the "statement" field.');
 
   try {
-    const workbook = XLSX.read(req.file.buffer, { type: 'buffer', cellDates: false });
-    const sheet = workbook.Sheets[workbook.SheetNames[0]];
-    const rows = XLSX.utils.sheet_to_json(sheet, { header: 1, raw: true, defval: '' });
+    let rows = null;
+    let headerRowIndex = -1;
 
-    const headerRowIndex = findHeaderRowIndex(rows);
-    if (headerRowIndex === -1) {
+    if (looksLikeHtml(req.file.buffer)) {
+      const htmlRows = parseHtmlTableRows(req.file.buffer.toString('utf8'));
+      const idx = findHeaderRowIndex(htmlRows);
+      if (idx !== -1) {
+        rows = htmlRows;
+        headerRowIndex = idx;
+      }
+    }
+
+    if (!rows) {
+      const workbook = XLSX.read(req.file.buffer, { type: 'buffer', cellDates: false });
+      for (const sheetName of workbook.SheetNames) {
+        const candidateRows = XLSX.utils.sheet_to_json(workbook.Sheets[sheetName], {
+          header: 1, raw: true, defval: '',
+        });
+        const idx = findHeaderRowIndex(candidateRows);
+        if (idx !== -1) {
+          rows = candidateRows;
+          headerRowIndex = idx;
+          break;
+        }
+      }
+    }
+
+    if (!rows || headerRowIndex === -1) {
       return res.status(400).send(
-        'Could not find a header row with recognizable date/amount columns. ' +
+        'Could not find a header row with recognizable date/amount columns in any sheet/table. ' +
         'The file format may not be supported yet -- try exporting as CSV instead of Excel, or vice versa.'
       );
     }
