@@ -1,4 +1,4 @@
-const BUSINESS_KEYWORDS = [
+ const BUSINESS_KEYWORDS = [
   'מע"מ', 'מעמ', 'מס הכנסה', 'ביטוח לאומי', 'חשבונית', 'עוסק מורשה',
   'שכר עובד', 'מקדמת מס', 'ניכוי מס', 'עמלת קנ', 'המרת קנ',
   'מקס איט פיננ', 'ל.מאסטרקרד', 'הו"ק לחיסכון',
@@ -29,4 +29,15 @@ function classifyTransaction({ category, note, subject }) {
   );
 }
 
-module.exports = { classifyText, classifyTransaction };
+const CREDIT_CARD_SETTLEMENT_KEYWORDS = [
+  'מאסטרקרד', 'ישראכרט', 'ל.ישראכרט', 'כאל', 'ויזה כאל', 'לאומי קארד',
+  'דיינרס', 'אמריקן אקספרס', 'איזי קארד',
+];
+
+function isCreditCardSettlement(text) {
+  if (!text) return false;
+  const lower = text.toLowerCase();
+  return CREDIT_CARD_SETTLEMENT_KEYWORDS.some((k) => lower.includes(k.toLowerCase()));
+}
+
+module.exports = { classifyText, classifyTransaction, isCreditCardSettlement };
