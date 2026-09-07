@@ -1,6 +1,6 @@
 const express = require('express');
 const pool = require('../db/pool');
-const { classifyTransaction } = require('../utils/classify');
+const { classifyTransaction, isCreditCardSettlement } = require('../utils/classify');
 
 const router = express.Router();
 
@@ -105,6 +105,46 @@ router.delete('/:id', async (req, res) => {
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'Failed to delete transaction' });
+  }
+});
+
+// GET /api/transactions/find-cc-settlements -- lists existing bank
+// transactions that look like credit-card-company settlements (candidates
+// for removal, to avoid double-counting once you import the itemized card
+// statement). Doesn't delete anything -- just shows you what it found.
+router.get('/find-cc-settlements', async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT id, date, amount, note FROM transactions WHERE source = 'bank' ORDER BY date DESC`
+    );
+    const matches = result.rows.filter((r) => isCreditCardSettlement(r.note));
+    if (!matches.length) return res.send('No credit-card settlement lines found.');
+    const total = matches.reduce((s, r) => s + parseFloat(r.amount), 0);
+    res.send(
+      `Found ${matches.length} candidate rows (total ${total.toFixed(2)} ILS):\n\n` +
+      matches.map((r) => `#${r.id}  ${r.date.toISOString().slice(0,10)}  ${r.amount} ILS  ${r.note}`).join('\n') +
+      `\n\nTo remove all of them, visit /api/transactions/remove-cc-settlements`
+    );
+  } catch (err) {
+    console.error(err);
+    res.status(500).send(`Failed: ${err.message}`);
+  }
+});
+
+// GET /api/transactions/remove-cc-settlements -- actually deletes them.
+router.get('/remove-cc-settlements', async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT id, note FROM transactions WHERE source = 'bank'`
+    );
+    const matches = result.rows.filter((r) => isCreditCardSettlement(r.note));
+    for (const row of matches) {
+      await pool.query(`DELETE FROM transactions WHERE id = $1`, [row.id]);
+    }
+    res.send(`Removed ${matches.length} credit-card settlement transactions. You can close this tab.`);
+  } catch (err) {
+    console.error(err);
+    res.status(500).send(`Failed: ${err.message}`);
   }
 });
 
