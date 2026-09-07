@@ -30,7 +30,7 @@ router.get('/', async (req, res) => {
 
 // POST /api/transactions
 router.post('/', async (req, res) => {
-  const { date, type, amount, category, note, vat_eligible } = req.body;
+  const { date, type, amount, category, note, vat_eligible, domain_category } = req.body;
 
   if (!date || !type || !amount || amount <= 0 || !['income', 'expense'].includes(type)) {
     return res.status(400).json({ error: 'Missing or invalid date/type/amount' });
@@ -38,14 +38,33 @@ router.post('/', async (req, res) => {
 
   try {
     const result = await pool.query(
-      `INSERT INTO transactions (date, type, amount, category, note, vat_eligible, source)
-       VALUES ($1, $2, $3, $4, $5, $6, 'manual') RETURNING *`,
-      [date, type, amount, category || '', note || '', vat_eligible !== false]
+      `INSERT INTO transactions (date, type, amount, category, note, vat_eligible, source, domain_category)
+       VALUES ($1, $2, $3, $4, $5, $6, 'manual', $7) RETURNING *`,
+      [date, type, amount, category || '', note || '', vat_eligible !== false, domain_category || '']
     );
     res.status(201).json(result.rows[0]);
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'Failed to create transaction' });
+  }
+});
+
+// PATCH /api/transactions/:id/category  { domain_category: "מזון" }
+router.patch('/:id/category', async (req, res) => {
+  const { domain_category } = req.body;
+  if (typeof domain_category !== 'string') {
+    return res.status(400).json({ error: 'Missing domain_category' });
+  }
+  try {
+    const result = await pool.query(
+      `UPDATE transactions SET domain_category = $1 WHERE id = $2 RETURNING *`,
+      [domain_category, req.params.id]
+    );
+    if (!result.rows.length) return res.status(404).json({ error: 'Transaction not found' });
+    res.json(result.rows[0]);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to update category' });
   }
 });
 
