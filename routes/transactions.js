@@ -1,5 +1,6 @@
 const express = require('express');
 const pool = require('../db/pool');
+const { classifyTransaction } = require('../utils/classify');
 
 const router = express.Router();
 
@@ -37,15 +38,43 @@ router.post('/', async (req, res) => {
   }
 
   try {
+    const autoCategory = domain_category || classifyTransaction({ category, note });
     const result = await pool.query(
       `INSERT INTO transactions (date, type, amount, category, note, vat_eligible, source, domain_category)
        VALUES ($1, $2, $3, $4, $5, $6, 'manual', $7) RETURNING *`,
-      [date, type, amount, category || '', note || '', vat_eligible !== false, domain_category || '']
+      [date, type, amount, category || '', note || '', vat_eligible !== false, autoCategory]
     );
     res.status(201).json(result.rows[0]);
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'Failed to create transaction' });
+  }
+});
+
+// GET /api/transactions/reclassify -- runs the keyword classifier over every
+// transaction that doesn't have a domain_category yet, and fills in what it
+// can recognize. Visit this URL in your browser after importing new data.
+router.get('/reclassify', async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT id, category, note FROM transactions WHERE domain_category IS NULL OR domain_category = ''`
+    );
+    let updated = 0;
+    for (const row of result.rows) {
+      const guess = classifyTransaction({ category: row.category, note: row.note });
+      if (guess) {
+        await pool.query(`UPDATE transactions SET domain_category = $1 WHERE id = $2`, [guess, row.id]);
+        updated += 1;
+      }
+    }
+    res.send(
+      `Checked ${result.rows.length} unclassified transactions, auto-classified ${updated}. ` +
+      `The rest need a manual pick in the ledger (they don't have enough info in their description). ` +
+      `You can close this tab.`
+    );
+  } catch (err) {
+    console.error(err);
+    res.status(500).send(`Failed to reclassify: ${err.message}`);
   }
 });
 
