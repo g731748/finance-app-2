@@ -2,6 +2,7 @@ require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 const cron = require('node-cron');
+const path = require('path');
 
 const transactionsRouter = require('./routes/transactions');
 const { router: gmailRouter, syncGmail } = require('./routes/gmail');
@@ -13,6 +14,10 @@ app.use(express.json());
 
 app.get('/', (req, res) => {
   res.send('Finance app server is running.');
+});
+
+app.get('/app', (req, res) => {
+  res.sendFile(path.join(__dirname, 'public', 'index.html'));
 });
 
 app.use('/api/transactions', transactionsRouter);
