@@ -1,176 +1,292 @@
 const express = require('express');
-const multer = require('multer');
-const XLSX = require('xlsx');
-const crypto = require('crypto');
+const { google } = require('googleapis');
+const pdfParse = require('pdf-parse');
 const pool = require('../db/pool');
+const { classifyTransaction } = require('../utils/classify');
 
 const router = express.Router();
-const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024 } });
 
-const HEADER_HINTS = {
-  date: ['תאריך', 'תאריך ערך', 'תאריך פעולה', 'date'],
-  description: ['תיאור', 'פרטים', 'תיאור פעולה', 'description', 'details'],
-  debit: ['חובה', 'debit'],
-  credit: ['זכות', 'credit'],
-  amount: ['סכום', 'amount'],
-  reference: ['אסמכתא', 'reference', 'מספר אסמכתא'],
-};
+const oauth2Client = new google.auth.OAuth2(
+  process.env.GOOGLE_CLIENT_ID,
+  process.env.GOOGLE_CLIENT_SECRET,
+  process.env.GOOGLE_REDIRECT_URI
+);
 
-function normalizeHeader(cell) {
-  return String(cell || '').trim().toLowerCase();
+const SCOPES = ['https://www.googleapis.com/auth/gmail.readonly'];
+
+const SEARCH_QUERY =
+  '(subject:חשבונית OR subject:קבלה OR subject:invoice OR subject:receipt ' +
+  'OR subject:"אישור תשלום" OR subject:"אישור חיוב")';
+
+const AMOUNT_PATTERN = /(?:₪|ILS|NIS|\$|USD)\s?([\d,]+\.?\d{0,2})|([\d,]+\.?\d{0,2})\s?(?:₪|ILS|NIS)/g;
+
+const TOTAL_KEYWORDS = [
+  'סה"כ לתשלום', 'סך הכל לתשלום', 'סה"כ לתשלום כולל מע"מ',
+  'סה"כ', 'סך הכל', 'לתשלום', 'total amount', 'amount due', 'total due', 'grand total', 'total',
+];
+
+const MAX_PLAUSIBLE_AMOUNT = 200000;
+
+function parseNumber(raw) {
+  const value = parseFloat(String(raw).replace(/,/g, ''));
+  if (!Number.isFinite(value) || value <= 0 || value > MAX_PLAUSIBLE_AMOUNT) return null;
+  return value;
 }
 
-function findColumnIndex(headerRow, hints) {
-  for (let i = 0; i < headerRow.length; i++) {
-    const cell = normalizeHeader(headerRow[i]);
-    if (hints.some((hint) => cell.includes(hint.toLowerCase()))) return i;
-  }
-  return -1;
+const DECIMAL_AMOUNT = /\d{1,3}(?:,\d{3})*\.\d{2}\b/;
+const BARE_DIGITS = /[\d,]{2,}/;
+
+function findAmountInWindow(window) {
+  return window.match(DECIMAL_AMOUNT) || window.match(BARE_DIGITS);
 }
 
-function findHeaderRowIndex(rows) {
-  const maxScan = Math.min(rows.length, 15);
-  for (let i = 0; i < maxScan; i++) {
-    const row = rows[i].map(normalizeHeader);
-    const hasDate = row.some((c) => HEADER_HINTS.date.some((h) => c.includes(h.toLowerCase())));
-    const hasAmount = row.some((c) =>
-      [...HEADER_HINTS.debit, ...HEADER_HINTS.credit, ...HEADER_HINTS.amount].some((h) => c.includes(h.toLowerCase()))
-    );
-    if (hasDate && hasAmount) return i;
+function extractAmountNearKeywords(text) {
+  if (!text) return null;
+  const lowerText = text.toLowerCase();
+  let best = null;
+  for (const keyword of TOTAL_KEYWORDS) {
+    const lowerKeyword = keyword.toLowerCase();
+    let searchFrom = 0;
+    let idx;
+    while ((idx = lowerText.indexOf(lowerKeyword, searchFrom)) !== -1) {
+      const afterWindow = text.slice(idx + keyword.length, idx + keyword.length + 25);
+      const beforeWindow = text.slice(Math.max(0, idx - 25), idx);
+      const numMatch = findAmountInWindow(afterWindow) || findAmountInWindow(beforeWindow);
+      if (numMatch) {
+        const value = parseNumber(numMatch[0]);
+        if (value !== null) best = value;
+      }
+      searchFrom = idx + keyword.length;
+    }
   }
-  return -1;
+  return best;
 }
 
-function parseDate(raw) {
-  if (raw == null || raw === '') return null;
-  if (typeof raw === 'number') {
-    const excelEpoch = new Date(Date.UTC(1899, 11, 30));
-    const d = new Date(excelEpoch.getTime() + raw * 86400000);
-    return d.toISOString().slice(0, 10);
-  }
-  const str = String(raw).trim();
-  let m = str.match(/^(\d{1,2})[\/.\-](\d{1,2})[\/.\-](\d{2,4})$/);
-  if (m) {
-    let [, d, mo, y] = m;
-    if (y.length === 2) y = '20' + y;
-    return `${y.padStart(4, '0')}-${mo.padStart(2, '0')}-${d.padStart(2, '0')}`;
-  }
-  m = str.match(/^(\d{4})[\/.\-](\d{1,2})[\/.\-](\d{1,2})$/);
-  if (m) {
-    const [, y, mo, d] = m;
-    return `${y}-${mo.padStart(2, '0')}-${d.padStart(2, '0')}`;
+function extractAmountByCurrency(text) {
+  if (!text) return null;
+  const matches = [...text.matchAll(AMOUNT_PATTERN)];
+  if (!matches.length) return null;
+  for (let i = matches.length - 1; i >= 0; i--) {
+    const value = parseNumber(matches[i][1] || matches[i][2]);
+    if (value !== null) return value;
   }
   return null;
 }
 
-function parseAmount(raw) {
-  if (raw == null || raw === '') return 0;
-  const cleaned = String(raw).replace(/[^\d.\-]/g, '');
-  const value = parseFloat(cleaned);
-  return Number.isFinite(value) ? value : 0;
+function extractAmount(text) {
+  return extractAmountNearKeywords(text) ?? extractAmountByCurrency(text);
 }
 
-router.get('/import-form', (req, res) => {
-  res.send(`<!DOCTYPE html>
-<html lang="he" dir="rtl"><head><meta charset="UTF-8"><title>ייבוא קובץ בנק</title>
-<style>body{font-family:sans-serif;max-width:480px;margin:60px auto;padding:0 20px}
-h1{font-size:20px}input,button{font-size:15px;padding:8px;margin-top:10px}
-button{background:#22314A;color:#fff;border:none;border-radius:4px;cursor:pointer}</style>
-</head><body>
-<h1>ייבוא קובץ תנועות מהבנק</h1>
-<p>בחר קובץ CSV או Excel שהורדת מאתר הבנק (עובר ושב).</p>
-<form action="/api/bank/import" method="post" enctype="multipart/form-data">
-  <input type="file" name="statement" accept=".csv,.xlsx,.xls" required><br>
-  <button type="submit">העלה וייבא</button>
-</form>
-</body></html>`);
+function decodeBody(payload) {
+  if (payload.mimeType === 'text/plain' && payload.body?.data) {
+    return Buffer.from(payload.body.data, 'base64').toString('utf8');
+  }
+  for (const part of payload.parts || []) {
+    const text = decodeBody(part);
+    if (text) return text;
+  }
+  return '';
+}
+
+async function loadRefreshToken() {
+  const result = await pool.query(`SELECT refresh_token FROM oauth_tokens WHERE provider = 'gmail'`);
+  return result.rows[0]?.refresh_token || null;
+}
+
+async function loadExcludedSenders() {
+  const result = await pool.query(`SELECT sender FROM excluded_senders`);
+  return new Set(result.rows.map((r) => r.sender));
+}
+
+router.get('/auth', (req, res) => {
+  if (!process.env.GOOGLE_CLIENT_ID || !process.env.GOOGLE_REDIRECT_URI) {
+    return res.status(500).send(
+      'Missing GOOGLE_CLIENT_ID or GOOGLE_REDIRECT_URI environment variable on the server.'
+    );
+  }
+  const url = oauth2Client.generateAuthUrl({
+    access_type: 'offline',
+    prompt: 'consent',
+    scope: SCOPES,
+    redirect_uri: process.env.GOOGLE_REDIRECT_URI,
+  });
+  res.redirect(url);
 });
 
-router.post('/import', upload.single('statement'), async (req, res) => {
-  if (!req.file) return res.status(400).send('No file uploaded -- use the "statement" field.');
-
+router.get('/callback', async (req, res) => {
   try {
-    const workbook = XLSX.read(req.file.buffer, { type: 'buffer', cellDates: false });
-    const sheet = workbook.Sheets[workbook.SheetNames[0]];
-    const rows = XLSX.utils.sheet_to_json(sheet, { header: 1, raw: true, defval: '' });
-
-    const headerRowIndex = findHeaderRowIndex(rows);
-    if (headerRowIndex === -1) {
+    const { tokens } = await oauth2Client.getToken(req.query.code);
+    if (!tokens.refresh_token) {
       return res.status(400).send(
-        'Could not find a header row with recognizable date/amount columns. ' +
-        'The file format may not be supported yet -- try exporting as CSV instead of Excel, or vice versa.'
+        'No refresh token returned. Revoke access at myaccount.google.com/permissions and try /api/gmail/auth again.'
       );
     }
+    await pool.query(
+      `INSERT INTO oauth_tokens (provider, refresh_token, updated_at)
+       VALUES ('gmail', $1, now())
+       ON CONFLICT (provider) DO UPDATE SET refresh_token = $1, updated_at = now()`,
+      [tokens.refresh_token]
+    );
+    res.send('Gmail connected successfully. You can close this tab.');
+  } catch (err) {
+    console.error(err);
+    res.status(500).send('OAuth exchange failed -- check server logs.');
+  }
+});
 
-    const headerRow = rows[headerRowIndex];
-    const dateCol = findColumnIndex(headerRow, HEADER_HINTS.date);
-    const descCol = findColumnIndex(headerRow, HEADER_HINTS.description);
-    const debitCol = findColumnIndex(headerRow, HEADER_HINTS.debit);
-    const creditCol = findColumnIndex(headerRow, HEADER_HINTS.credit);
-    const amountCol = findColumnIndex(headerRow, HEADER_HINTS.amount);
-    const refCol = findColumnIndex(headerRow, HEADER_HINTS.reference);
+async function syncGmail(days = 30) {
+  const refreshToken = await loadRefreshToken();
+  if (!refreshToken) {
+    throw new Error('Gmail not connected yet -- visit /api/gmail/auth first.');
+  }
+  oauth2Client.setCredentials({ refresh_token: refreshToken });
+  const gmail = google.gmail({ version: 'v1', auth: oauth2Client });
 
-    if (dateCol === -1 || (debitCol === -1 && creditCol === -1 && amountCol === -1)) {
-      return res.status(400).send(
-        'Found a header row, but could not identify both a date column and an amount column. ' +
-        `Header seen: ${JSON.stringify(headerRow)}`
-      );
+  const after = new Date(Date.now() - days * 86400000);
+  const afterStr = `${after.getFullYear()}/${after.getMonth() + 1}/${after.getDate()}`;
+  const query = `${SEARCH_QUERY} after:${afterStr}`;
+
+  const list = await gmail.users.messages.list({ userId: 'me', q: query, maxResults: 100 });
+  const messages = list.data.messages || [];
+  const excludedSenders = await loadExcludedSenders();
+
+  let inserted = 0;
+  let skipped = 0;
+  for (const ref of messages) {
+    const msg = await gmail.users.messages.get({ userId: 'me', id: ref.id, format: 'full' });
+    const headers = Object.fromEntries(
+      msg.data.payload.headers.map((h) => [h.name, h.value])
+    );
+    const subject = headers.Subject || '(no subject)';
+    const sender = (headers.From || 'unknown').split('<')[0].trim();
+    const dateHeader = headers.Date ? new Date(headers.Date) : new Date();
+
+    if (excludedSenders.has(sender)) {
+      skipped += 1;
+      continue;
     }
 
-    const dataRows = rows.slice(headerRowIndex + 1);
-    let inserted = 0;
-    let skipped = 0;
-
-    for (const row of dataRows) {
-      const dateRaw = row[dateCol];
-      const date = parseDate(dateRaw);
-      if (!date) continue;
-
-      const description = descCol !== -1 ? String(row[descCol] || '').trim() : '';
-      const reference = refCol !== -1 ? String(row[refCol] || '').trim() : '';
-
-      let type, amount;
-      if (debitCol !== -1 || creditCol !== -1) {
-        const debit = debitCol !== -1 ? parseAmount(row[debitCol]) : 0;
-        const credit = creditCol !== -1 ? parseAmount(row[creditCol]) : 0;
-        if (debit > 0) { type = 'expense'; amount = debit; }
-        else if (credit > 0) { type = 'income'; amount = credit; }
-        else continue;
-      } else {
-        const raw = parseAmount(row[amountCol]);
-        if (raw === 0) continue;
-        type = raw < 0 ? 'expense' : 'income';
-        amount = Math.abs(raw);
-      }
-
-      const fingerprint = crypto
-        .createHash('sha1')
-        .update(`${date}|${description}|${amount}|${reference}`)
-        .digest('hex');
-
-      try {
-        const result = await pool.query(
-          `INSERT INTO transactions (date, type, amount, category, note, vat_eligible, source, external_id)
-           VALUES ($1, $2, $3, '', $4, TRUE, 'bank', $5)
-           ON CONFLICT (source, external_id) WHERE external_id IS NOT NULL DO NOTHING
-           RETURNING id`,
-          [date, type, amount, description, fingerprint]
-        );
-        if (result.rowCount) inserted += 1; else skipped += 1;
-      } catch (e) {
-        console.error('Failed to insert bank row', e);
-        skipped += 1;
+    const body = decodeBody(msg.data.payload);
+    let attachmentText = '';
+    for (const part of msg.data.payload.parts || []) {
+      if (part.filename?.toLowerCase().endsWith('.pdf') && part.body?.attachmentId) {
+        const attachment = await gmail.users.messages.attachments.get({
+          userId: 'me',
+          messageId: ref.id,
+          id: part.body.attachmentId,
+        });
+        const buffer = Buffer.from(attachment.data.data, 'base64');
+        try {
+          const parsed = await pdfParse(buffer);
+          attachmentText += parsed.text + '\n';
+        } catch (e) { /* skip unparsable PDFs */ }
       }
     }
 
+    const amount = extractAmount(attachmentText) || extractAmount(body) || extractAmount(subject);
+    const domainCategory = classifyTransaction({ category: sender, note: subject });
+
+    try {
+      const result = await pool.query(
+        `INSERT INTO transactions (date, type, amount, category, note, vat_eligible, source, external_id, domain_category)
+         VALUES ($1, 'expense', $2, $3, $4, TRUE, 'gmail', $5, $6)
+         ON CONFLICT (source, external_id) WHERE external_id IS NOT NULL
+         DO UPDATE SET amount = EXCLUDED.amount
+         WHERE (transactions.amount = 0 OR transactions.amount > 200000) AND EXCLUDED.amount != 0
+         RETURNING id, (xmax = 0) AS inserted`,
+        [dateHeader.toISOString().slice(0, 10), amount || 0, sender, subject, ref.id, domainCategory]
+      );
+      if (result.rowCount) inserted += 1;
+    } catch (e) {
+      console.error('Failed to insert message', ref.id, e);
+    }
+  }
+
+  return { scanned: messages.length, inserted, skipped };
+}
+
+router.post('/sync', async (req, res) => {
+  try {
+    const days = parseInt(req.body?.days, 10) || 30;
+    const result = await syncGmail(days);
+    res.json(result);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+router.get('/sync-now', async (req, res) => {
+  try {
+    const days = parseInt(req.query.days, 10) || 30;
+    const result = await syncGmail(days);
     res.send(
-      `Imported ${inserted} new transactions, skipped ${skipped} (duplicates or blank rows). ` +
+      `Scanned ${result.scanned} emails, added ${result.inserted} new transactions, ` +
+      `skipped ${result.skipped} from excluded senders. ` +
       `You can close this tab and check /api/transactions.`
     );
   } catch (err) {
     console.error(err);
-    res.status(500).send(`Failed to parse file: ${err.message}`);
+    res.status(500).send(`Sync failed: ${err.message}`);
   }
 });
 
-module.exports = { router };
+router.get('/exclude-transaction', async (req, res) => {
+  const id = parseInt(req.query.id, 10);
+  if (!id) return res.status(400).send('Missing or invalid ?id= query parameter.');
+
+  try {
+    const txResult = await pool.query(
+      `SELECT category, note FROM transactions WHERE id = $1 AND source = 'gmail'`,
+      [id]
+    );
+    if (!txResult.rows.length) {
+      return res.status(404).send(`No Gmail-sourced transaction found with id ${id}.`);
+    }
+    const sender = txResult.rows[0].category;
+    if (!sender) {
+      return res.status(400).send('This transaction has no sender recorded -- cannot block it.');
+    }
+
+    await pool.query(
+      `INSERT INTO excluded_senders (sender, reason) VALUES ($1, 'excluded via transaction') ON CONFLICT (sender) DO NOTHING`,
+      [sender]
+    );
+    await pool.query(`DELETE FROM transactions WHERE id = $1`, [id]);
+
+    res.send(
+      `Removed transaction #${id} and blocked future emails from "${sender}". ` +
+      `You can close this tab.`
+    );
+  } catch (err) {
+    console.error(err);
+    res.status(500).send(`Failed to exclude transaction: ${err.message}`);
+  }
+});
+
+router.get('/excluded-senders', async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT sender, created_at FROM excluded_senders ORDER BY created_at DESC`
+    );
+    if (!result.rows.length) return res.send('No senders are excluded yet.');
+    res.send(result.rows.map((r) => `${r.sender}  (blocked ${r.created_at.toISOString().slice(0, 10)})`).join('\n'));
+  } catch (err) {
+    console.error(err);
+    res.status(500).send(`Failed to load excluded senders: ${err.message}`);
+  }
+});
+
+router.get('/unexclude-sender', async (req, res) => {
+  const sender = req.query.sender;
+  if (!sender) return res.status(400).send('Missing ?sender= query parameter.');
+  try {
+    await pool.query(`DELETE FROM excluded_senders WHERE sender = $1`, [sender]);
+    res.send(`Unblocked "${sender}". Their emails will be picked up on the next sync.`);
+  } catch (err) {
+    console.error(err);
+    res.status(500).send(`Failed to unblock sender: ${err.message}`);
+  }
+});
+
+module.exports = { router, syncGmail };
