@@ -3,6 +3,7 @@ const multer = require('multer');
 const XLSX = require('xlsx');
 const crypto = require('crypto');
 const pool = require('../db/pool');
+const { classifyTransaction } = require('../utils/classify');
 
 const router = express.Router();
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024 } });
@@ -194,14 +195,15 @@ router.post('/import', upload.single('statement'), async (req, res) => {
         .createHash('sha1')
         .update(`${date}|${description}|${amount}|${reference}`)
         .digest('hex');
+      const domainCategory = classifyTransaction({ note: description });
 
       try {
         const result = await pool.query(
-          `INSERT INTO transactions (date, type, amount, category, note, vat_eligible, source, external_id)
-           VALUES ($1, $2, $3, '', $4, TRUE, 'bank', $5)
+          `INSERT INTO transactions (date, type, amount, category, note, vat_eligible, source, external_id, domain_category)
+           VALUES ($1, $2, $3, '', $4, TRUE, 'bank', $5, $6)
            ON CONFLICT (source, external_id) WHERE external_id IS NOT NULL DO NOTHING
            RETURNING id`,
-          [date, type, amount, description, fingerprint]
+          [date, type, amount, description, fingerprint, domainCategory]
         );
         if (result.rowCount) inserted += 1; else skipped += 1;
       } catch (e) {
