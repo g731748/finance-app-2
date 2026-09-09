@@ -68,7 +68,7 @@
 
   form.entry{
     display:grid;
-    grid-template-columns:auto 1fr 1fr 1fr auto;
+    grid-template-columns:auto 1fr 1fr 1fr 1fr auto;
     gap:8px;align-items:end;
     background:var(--paper-2);padding:14px;border:1px solid var(--hairline);border-radius:4px;
   }
@@ -162,10 +162,15 @@
 <div class="wrap">
   <header>
     <h1>פנקס הכנסות והוצאות</h1>
-    <div class="month-nav">
-      <button id="prevMonth">‹</button>
-      <span class="month-label" id="monthLabel"></span>
-      <button id="nextMonth">›</button>
+    <div style="display:flex;align-items:center;gap:12px;">
+      <button id="syncBtn" style="background:var(--gold);color:#fff;border:none;border-radius:4px;padding:6px 14px;font-size:13px;cursor:pointer;font-family:'Assistant',sans-serif;font-weight:600;">
+        משוך קבלות חדשות
+      </button>
+      <div class="month-nav">
+        <button id="prevMonth">‹</button>
+        <span class="month-label" id="monthLabel"></span>
+        <button id="nextMonth">›</button>
+      </div>
     </div>
   </header>
 
@@ -203,8 +208,14 @@
         <input type="number" id="fAmount" step="0.01" placeholder="0">
       </div>
       <div class="field">
-        <label>קטגוריה</label>
-        <input type="text" id="fCategory" placeholder="למשל: מזון, שכר דירה">
+        <label>תיאור</label>
+        <input type="text" id="fCategory" placeholder="למשל: סופר יש, שכר דירה">
+      </div>
+      <div class="field">
+        <label>סיווג</label>
+        <select id="fDomainCategory">
+          <option value="">ללא סיווג</option>
+        </select>
       </div>
       <button type="submit" class="add-btn">הוסף</button>
       <label class="vat-check" id="vatCheckWrap" style="display:none;">
@@ -272,6 +283,13 @@ function monthKey(d){
 
 const HEBREW_MONTHS = ['ינואר','פברואר','מרץ','אפריל','מאי','יוני','יולי','אוגוסט','ספטמבר','אוקטובר','נובמבר','דצמבר'];
 
+const CATEGORIES = ['מזון','רכב','בית','בריאות','ביגוד','בילויים ופנאי','חינוך','עסק','ביטוח','מתנות ותרומות','משכורת','אחר'];
+
+function populateCategorySelect(select, selected){
+  select.innerHTML = '<option value="">ללא סיווג</option>' +
+    CATEGORIES.map(c => `<option value="${c}" ${c===selected?'selected':''}>${c}</option>`).join('');
+}
+
 async function loadData(){
   try{
     const res = await fetch(`${API_BASE}/api/transactions`);
@@ -283,6 +301,7 @@ async function loadData(){
       date: String(r.date).slice(0, 10),
       category: r.category || '',
       note: r.note || '',
+      domainCategory: r.domain_category || '',
       vatEligible: r.vat_eligible,
       source: r.source,
     }));
@@ -333,11 +352,14 @@ function render(){
       : '';
     tr.innerHTML = `
       <td>${dateStr}</td>
-      <td class="cat">${gmailBadge}${escapeHtml(t.category || 'ללא קטגוריה')}${noteLine}</td>
+      <td class="cat">${gmailBadge}${escapeHtml(t.category || 'ללא קטגוריה')}${noteLine}
+        <select class="cat-select" data-id="${t.id}" style="margin-top:4px;font-size:11px;padding:2px 4px;border:1px solid var(--hairline);border-radius:3px;background:#fff;color:var(--ink-soft);"></select>
+      </td>
       <td class="amount ${t.type}">${t.type==='expense'?'-':'+'}${fmt(t.amount)}</td>
       <td><button class="del-btn" data-id="${t.id}" aria-label="מחק">✕</button></td>
     `;
     tbody.appendChild(tr);
+    populateCategorySelect(tr.querySelector('.cat-select'), t.domainCategory);
   });
 
   tbody.querySelectorAll('.del-btn').forEach(btn=>{
@@ -351,9 +373,24 @@ function render(){
     });
   });
 
+  tbody.querySelectorAll('.cat-select').forEach(sel=>{
+    sel.addEventListener('change', async ()=>{
+      try{
+        await fetch(`${API_BASE}/api/transactions/${sel.dataset.id}/category`, {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ domain_category: sel.value })
+        });
+      }catch(e){
+        console.error('Failed to update category', e);
+      }
+      await loadData();
+    });
+  });
+
   const catMap = {};
   monthTx.filter(t=>t.type==='expense').forEach(t=>{
-    const c = t.category || 'ללא קטגוריה';
+    const c = t.domainCategory || 'לא מסווג';
     catMap[c] = (catMap[c]||0) + t.amount;
   });
   const catEntries = Object.entries(catMap).sort((a,b)=>b[1]-a[1]);
@@ -399,7 +436,27 @@ document.getElementById('nextMonth').addEventListener('click', ()=>{
   render();
 });
 
+document.getElementById('syncBtn').addEventListener('click', async ()=>{
+  const btn = document.getElementById('syncBtn');
+  const originalText = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = 'מושך קבלות...';
+  try{
+    const res = await fetch(`${API_BASE}/api/gmail/sync-now?days=30`);
+    const text = await res.text();
+    alert(text);
+    await loadData();
+  }catch(e){
+    console.error('Sync failed', e);
+    alert('שגיאה במשיכת קבלות. נסה שוב.');
+  }finally{
+    btn.disabled = false;
+    btn.textContent = originalText;
+  }
+});
+
 document.getElementById('fDate').valueAsDate = new Date();
+populateCategorySelect(document.getElementById('fDomainCategory'));
 
 document.getElementById('entryForm').addEventListener('submit', async (e)=>{
   e.preventDefault();
@@ -423,6 +480,7 @@ document.getElementById('entryForm').addEventListener('submit', async (e)=>{
         type: currentType,
         amount: amount,
         category: category,
+        domain_category: document.getElementById('fDomainCategory').value,
         vat_eligible: currentType === 'expense' ? document.getElementById('fVatEligible').checked : false
       })
     });
@@ -435,6 +493,7 @@ document.getElementById('entryForm').addEventListener('submit', async (e)=>{
 
   document.getElementById('fAmount').value = '';
   document.getElementById('fCategory').value = '';
+  document.getElementById('fDomainCategory').value = '';
   await loadData();
 });
 
