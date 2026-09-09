@@ -7,7 +7,9 @@ const router = express.Router();
 // GET /api/transactions?year=2026&month=03
 router.get('/', async (req, res) => {
   const { year, month } = req.query;
-  let query = 'SELECT * FROM transactions WHERE 1=1';
+  let query = `SELECT id, date, type, amount, category, note, vat_eligible, source, external_id,
+                      domain_category, created_at, (attachment_data IS NOT NULL) AS has_attachment
+               FROM transactions WHERE 1=1`;
   const params = [];
 
   if (year) {
@@ -86,7 +88,8 @@ router.patch('/:id/category', async (req, res) => {
   }
   try {
     const result = await pool.query(
-      `UPDATE transactions SET domain_category = $1 WHERE id = $2 RETURNING *`,
+      `UPDATE transactions SET domain_category = $1 WHERE id = $2
+       RETURNING id, date, type, amount, category, note, vat_eligible, source, domain_category`,
       [domain_category, req.params.id]
     );
     if (!result.rows.length) return res.status(404).json({ error: 'Transaction not found' });
@@ -94,6 +97,46 @@ router.patch('/:id/category', async (req, res) => {
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'Failed to update category' });
+  }
+});
+
+// PATCH /api/transactions/:id/amount  { amount: 123.45 }
+router.patch('/:id/amount', async (req, res) => {
+  const amount = parseFloat(req.body.amount);
+  if (!Number.isFinite(amount) || amount <= 0) {
+    return res.status(400).json({ error: 'Invalid amount' });
+  }
+  try {
+    const result = await pool.query(
+      `UPDATE transactions SET amount = $1 WHERE id = $2 RETURNING id, date, type, amount, category, note, vat_eligible, source, domain_category`,
+      [amount, req.params.id]
+    );
+    if (!result.rows.length) return res.status(404).json({ error: 'Transaction not found' });
+    res.json(result.rows[0]);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to update amount' });
+  }
+});
+
+// GET /api/transactions/:id/attachment -- serves the original PDF (invoice/
+// receipt) that was pulled from Gmail for this transaction, if one exists.
+router.get('/:id/attachment', async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT attachment_data, attachment_filename, attachment_mimetype FROM transactions WHERE id = $1`,
+      [req.params.id]
+    );
+    const row = result.rows[0];
+    if (!row || !row.attachment_data) {
+      return res.status(404).send('No attachment stored for this transaction.');
+    }
+    res.setHeader('Content-Type', row.attachment_mimetype || 'application/pdf');
+    res.setHeader('Content-Disposition', `inline; filename="${row.attachment_filename || 'receipt.pdf'}"`);
+    res.send(row.attachment_data);
+  } catch (err) {
+    console.error(err);
+    res.status(500).send('Failed to load attachment.');
   }
 });
 
