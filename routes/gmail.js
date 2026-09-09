@@ -168,6 +168,8 @@ async function syncGmail(days = 30) {
 
     const body = decodeBody(msg.data.payload);
     let attachmentText = '';
+    let attachmentBuffer = null;
+    let attachmentFilename = null;
     for (const part of msg.data.payload.parts || []) {
       if (part.filename?.toLowerCase().endsWith('.pdf') && part.body?.attachmentId) {
         const attachment = await gmail.users.messages.attachments.get({
@@ -176,6 +178,10 @@ async function syncGmail(days = 30) {
           id: part.body.attachmentId,
         });
         const buffer = Buffer.from(attachment.data.data, 'base64');
+        if (!attachmentBuffer) {
+          attachmentBuffer = buffer;
+          attachmentFilename = part.filename;
+        }
         try {
           const parsed = await pdfParse(buffer);
           attachmentText += parsed.text + '\n';
@@ -188,13 +194,13 @@ async function syncGmail(days = 30) {
 
     try {
       const result = await pool.query(
-        `INSERT INTO transactions (date, type, amount, category, note, vat_eligible, source, external_id, domain_category)
-         VALUES ($1, 'expense', $2, $3, $4, TRUE, 'gmail', $5, $6)
+        `INSERT INTO transactions (date, type, amount, category, note, vat_eligible, source, external_id, domain_category, attachment_data, attachment_filename, attachment_mimetype)
+         VALUES ($1, 'expense', $2, $3, $4, TRUE, 'gmail', $5, $6, $7, $8, 'application/pdf')
          ON CONFLICT (source, external_id) WHERE external_id IS NOT NULL
          DO UPDATE SET amount = EXCLUDED.amount
          WHERE (transactions.amount = 0 OR transactions.amount > 200000) AND EXCLUDED.amount != 0
          RETURNING id, (xmax = 0) AS inserted`,
-        [dateHeader.toISOString().slice(0, 10), amount || 0, sender, subject, ref.id, domainCategory]
+        [dateHeader.toISOString().slice(0, 10), amount || 0, sender, subject, ref.id, domainCategory, attachmentBuffer, attachmentFilename]
       );
       if (result.rowCount) inserted += 1;
     } catch (e) {
