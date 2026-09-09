@@ -304,6 +304,7 @@ async function loadData(){
       domainCategory: r.domain_category || '',
       vatEligible: r.vat_eligible,
       source: r.source,
+      hasAttachment: r.has_attachment,
     }));
   }catch(e){
     console.error('Failed to load from server', e);
@@ -350,12 +351,18 @@ function render(){
     const noteLine = t.note
       ? `<div style="font-size:11px;color:var(--ink-soft);margin-top:2px;">${escapeHtml(t.note)}</div>`
       : '';
+    const attachLink = t.hasAttachment
+      ? `<a href="${API_BASE}/api/transactions/${t.id}/attachment" target="_blank" rel="noopener" style="font-size:10px;color:var(--gold);text-decoration:none;margin-right:6px;" title="צפה בקובץ המקורי">📎 קובץ</a>`
+      : '';
     tr.innerHTML = `
       <td>${dateStr}</td>
-      <td class="cat">${gmailBadge}${escapeHtml(t.category || 'ללא קטגוריה')}${noteLine}
+      <td class="cat">${gmailBadge}${attachLink}${escapeHtml(t.category || 'ללא קטגוריה')}${noteLine}
         <select class="cat-select" data-id="${t.id}" style="margin-top:4px;font-size:11px;padding:2px 4px;border:1px solid var(--hairline);border-radius:3px;background:#fff;color:var(--ink-soft);"></select>
       </td>
-      <td class="amount ${t.type}">${t.type==='expense'?'-':'+'}${fmt(t.amount)}</td>
+      <td class="amount ${t.type}">
+        ${t.type==='expense'?'-':'+'}${fmt(t.amount)}
+        <button class="edit-amount-btn" data-id="${t.id}" data-amount="${t.amount}" aria-label="ערוך סכום" style="background:none;border:none;color:var(--ink-soft);cursor:pointer;font-size:12px;padding:0 2px;">✎</button>
+      </td>
       <td><button class="del-btn" data-id="${t.id}" aria-label="מחק">✕</button></td>
     `;
     tbody.appendChild(tr);
@@ -368,6 +375,29 @@ function render(){
         await fetch(`${API_BASE}/api/transactions/${btn.dataset.id}`, { method: 'DELETE' });
       }catch(e){
         console.error('Failed to delete transaction', e);
+      }
+      await loadData();
+    });
+  });
+
+  tbody.querySelectorAll('.edit-amount-btn').forEach(btn=>{
+    btn.addEventListener('click', async ()=>{
+      const current = btn.dataset.amount;
+      const input = prompt('סכום חדש (₪):', current);
+      if (input === null) return;
+      const newAmount = parseFloat(input);
+      if (!newAmount || newAmount <= 0) {
+        alert('סכום לא תקין');
+        return;
+      }
+      try{
+        await fetch(`${API_BASE}/api/transactions/${btn.dataset.id}/amount`, {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ amount: newAmount })
+        });
+      }catch(e){
+        console.error('Failed to update amount', e);
       }
       await loadData();
     });
